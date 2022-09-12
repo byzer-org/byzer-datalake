@@ -1,8 +1,7 @@
 package org.apache.spark.sql.delta.commands
 
-import java.util.UUID
-
 import org.apache.hadoop.fs.Path
+import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
 import org.apache.spark.sql.delta._
 import org.apache.spark.sql.delta.actions._
 import org.apache.spark.sql.delta.schema.{ImplicitMetadataOperation, SchemaUtils}
@@ -14,13 +13,16 @@ import org.apache.spark.sql.types._
 import org.apache.spark.sql.{Dataset, Row, SaveMode, SparkSession, functions => F}
 import tech.mlsql.common.{BloomFilter, DeltaJob}
 
+import java.util.UUID
+
 case class UpsertTableInDelta(_data: Dataset[_],
                               saveMode: Option[SaveMode],
                               outputMode: Option[OutputMode],
                               deltaLog: DeltaLog,
                               options: DeltaOptions,
                               partitionColumns: Seq[String],
-                              configuration: Map[String, String]
+                              configuration: Map[String, String],
+                              child:Seq[LogicalPlan] = Seq()
                              ) extends RunnableCommand
   with ImplicitMetadataOperation
   with DeltaCommand with DeltaCommandsFun {
@@ -55,7 +57,8 @@ case class UpsertTableInDelta(_data: Dataset[_],
         deltaLog.withNewTransaction { txn =>
           txn.readWholeTable()
           if (!upsertConf.isPartialMerge) {
-            updateMetadata(txn, _data, partitionColumns, configuration, false)
+            updateMetadata(sparkSession, txn, _data.schema, partitionColumns, configuration,
+              false, false)
           }
           actions = upsert(txn, sparkSession, runId)
           val operation = DeltaOperations.Write(SaveMode.Overwrite,
@@ -78,12 +81,8 @@ case class UpsertTableInDelta(_data: Dataset[_],
           // Streaming sinks can't blindly overwrite schema.
           // See Schema Management design doc for details
           if (!upsertConf.isPartialMerge) {
-            updateMetadata(
-              txn,
-              _data,
-              partitionColumns,
-              configuration = Map.empty,
-              false)
+            updateMetadata(sparkSession, txn, _data.schema, partitionColumns, configuration,
+              false, false)
           }
           val currentVersion = txn.txnVersion(queryId)
           val batchId = configuration(UpsertTableInDelta.BATCH_ID).toLong
@@ -144,17 +143,17 @@ case class UpsertTableInDelta(_data: Dataset[_],
     if (upsertConf.isInitial && upsertConf.isPartialMerge) {
       throw new RuntimeException(s"Please init the table or disable ${UpsertTableInDelta.PARTIAL_MERGE}")
     }
-
+    val fs = deltaLog.logPath.getFileSystem(deltaLog.newDeltaHadoopConf())
     if (upsertConf.isInitial) {
 
-      deltaLog.fs.mkdirs(deltaLog.logPath)
+      fs.mkdirs(deltaLog.logPath)
 
       val newFiles = if (!isDelete) {
         txn.writeFiles(data.repartition(1), Some(options))
       } else Seq()
-      if(upsertConf.isBloomFilterEnable){
-        upsertBF.generateBFForParquetFile(sourceSchema, newFiles, Seq())
-      }
+      //      if(upsertConf.isBloomFilterEnable){
+      //        upsertBF.generateBFForParquetFile(sourceSchema, newFiles.map(_.), Seq())
+      //      }
       return newFiles
     }
 
@@ -190,7 +189,7 @@ case class UpsertTableInDelta(_data: Dataset[_],
         }
       }
       logInfo(s"whereStatement: ${whereStatement.mkString(" and ")}")
-      val predicates = parsePartitionPredicates(sparkSession, whereStatement.mkString(" and "))
+      val predicates = parsePredicates(sparkSession, whereStatement.mkString(" and "))
       Some(predicates)
 
     } else None
@@ -214,7 +213,7 @@ case class UpsertTableInDelta(_data: Dataset[_],
 
     // filter files are affected by BF
     val bfPath = new Path(deltaLog.dataPath, "_bf_index_" + deltaLog.snapshot.version)
-    val filesAreAffectedWithDeltaFormat = if (upsertConf.isBloomFilterEnable && deltaLog.fs.exists(bfPath)) {
+    val filesAreAffectedWithDeltaFormat = if (upsertConf.isBloomFilterEnable && fs.exists(bfPath)) {
       val schemaNames = data.schema.map(f => f.name)
       val dataBr = sparkSession.sparkContext.broadcast(data.select(idColsList.map(F.col(_)): _*).collect())
       val affectedFilePaths = sparkSession.read.parquet(bfPath.toUri.getPath).as[BFItem].flatMap { bfItem =>
@@ -258,7 +257,7 @@ case class UpsertTableInDelta(_data: Dataset[_],
       // the order of fields are important
       //这里会导致schema被修改
       val newDF = affectedRecords.join(data,
-        usingColumns = idColsList, joinType = "fullOuter").select(sourceSchema.fields.map(field=>F.col(field.name)):_*)
+        usingColumns = idColsList, joinType = "fullOuter").select(sourceSchema.fields.map(field => F.col(field.name)): _*)
       val sourceLen = sourceSchema.fields.length
       val sourceSchemaSeq = sourceSchema.map(f => f.name)
       val targetSchemaSeq = data.schema.map(f => f.name)
@@ -288,9 +287,9 @@ case class UpsertTableInDelta(_data: Dataset[_],
         txn.writeFiles(newTempData, Some(options))
       } else Seq()
 
-      if (upsertConf.isBloomFilterEnable) {
-        upsertBF.generateBFForParquetFile(sourceSchema, newFiles, deletedFiles)
-      }
+//      if (upsertConf.isBloomFilterEnable) {
+//        upsertBF.generateBFForParquetFile(sourceSchema, newFiles, deletedFiles)
+//      }
       logInfo(s"Update info: newFiles:${newFiles.size}  deletedFiles:${deletedFiles.size}")
       newFiles ++ deletedFiles
 
@@ -298,7 +297,7 @@ case class UpsertTableInDelta(_data: Dataset[_],
       //这里会导致schema被修改
       var notChangedRecords = affectedRecords.join(data,
         usingColumns = idColsList, joinType = "leftanti").
-        drop(F.col(UpsertTableInDelta.FILE_NAME)).select(sourceSchema.fields.map(field=>F.col(field.name)):_*)
+        drop(F.col(UpsertTableInDelta.FILE_NAME)).select(sourceSchema.fields.map(field => F.col(field.name)): _*)
 
 
       val newFiles = if (isDelete) {
@@ -319,9 +318,9 @@ case class UpsertTableInDelta(_data: Dataset[_],
         txn.writeFiles(newTempData, Some(options))
       }
 
-      if (upsertConf.isBloomFilterEnable) {
-        upsertBF.generateBFForParquetFile(sourceSchema, newFiles, deletedFiles)
-      }
+//      if (upsertConf.isBloomFilterEnable) {
+//        upsertBF.generateBFForParquetFile(sourceSchema, newFiles, deletedFiles)
+//      }
       logInfo(s"Update info: newFiles:${newFiles.size} deletedFiles:${deletedFiles.size} ")
       newFiles ++ deletedFiles
     }
@@ -332,6 +331,9 @@ case class UpsertTableInDelta(_data: Dataset[_],
   override protected val canMergeSchema: Boolean = false
   override protected val canOverwriteSchema: Boolean = false
 
+  override protected def withNewChildrenInternal(newChildren: IndexedSeq[LogicalPlan]): LogicalPlan = {
+    copy(child = newChildren)
+  }
 }
 
 object UpsertTableInDelta {

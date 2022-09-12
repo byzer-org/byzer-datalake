@@ -21,7 +21,7 @@ class MLSQLDeltaDataSource extends DeltaDataSource {
       throw DeltaErrors.pathNotSpecifiedException
     })
     if (outputMode != OutputMode.Append && outputMode != OutputMode.Complete) {
-      throw DeltaErrors.outputModeNotSupportedException(getClass.getName, outputMode)
+      throw DeltaErrors.outputModeNotSupportedException(getClass.getName, outputMode.toString)
     }
     val deltaOptions = new DeltaOptions(parameters, sqlContext.sparkSession.sessionState.conf)
     new MLSQLDeltaSink(sqlContext, new Path(path), partitionColumns, outputMode, deltaOptions, parameters)
