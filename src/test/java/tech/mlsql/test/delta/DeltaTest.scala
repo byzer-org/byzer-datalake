@@ -18,6 +18,8 @@ object DeltaTest {
       mode("Overwrite").
       //option("idCols","id").
       save("/tmp/jack")
+
+    spark.read.format("org.apache.spark.sql.delta.sources.MLSQLDeltaDataSource").load("/tmp/jack").show(10)
   }
 }
 
