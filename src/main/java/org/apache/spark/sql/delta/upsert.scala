@@ -66,12 +66,13 @@ class UpsertTableInDeltaConf(configuration: Map[String, String], @transient val 
 class UpsertCommit(deltaLog: DeltaLog, runId: String, upserConf: UpsertTableInDeltaConf) {
 
   def commit(txn: OptimisticTransaction, actions: Seq[Action], op: DeltaOperations.Operation): Long = {
+    val fs = deltaLog.logPath.getFileSystem(deltaLog.newDeltaHadoopConf())
     val currentV = deltaLog.snapshot.version.toInt
 
     def cleanTmpBFIndex(v: Long) = {
       try {
         val newBFPathFs = new Path(deltaLog.dataPath, "_bf_index_" + v + "_" + runId)
-        deltaLog.fs.delete(newBFPathFs, true)
+        fs.delete(newBFPathFs, true)
       } catch {
         case e1: Exception =>
       }
@@ -80,7 +81,7 @@ class UpsertCommit(deltaLog: DeltaLog, runId: String, upserConf: UpsertTableInDe
     def cleanOldBFIndex(v: Long) = {
       try {
         val newBFPathFs = new Path(deltaLog.dataPath, "_bf_index_" + v)
-        deltaLog.fs.delete(newBFPathFs, true)
+        fs.delete(newBFPathFs, true)
       } catch {
         case e1: Exception =>
       }
@@ -90,7 +91,7 @@ class UpsertCommit(deltaLog: DeltaLog, runId: String, upserConf: UpsertTableInDe
       try {
         val newBFPathFs = new Path(deltaLog.dataPath, "_bf_index_" + v + "_" + runId)
         val targetPath = new Path(deltaLog.dataPath, "_bf_index_" + v)
-        deltaLog.fs.rename(newBFPathFs, targetPath)
+        fs.rename(newBFPathFs, targetPath)
       } catch {
         case e1: Exception =>
       }
@@ -120,7 +121,9 @@ class UpsertBF(upsertConf: UpsertTableInDeltaConf, runId: String) {
   import upsertConf.sparkSession.implicits._
 
   def generateBFForParquetFile(sourceSchema: StructType, addFiles: Seq[AddFile], deletedFiles: Seq[RemoveFile]) = {
+
     val deltaLog = upsertConf.deltaLog
+    val fs = deltaLog.logPath.getFileSystem(deltaLog.newDeltaHadoopConf())
     val snapshot = deltaLog.snapshot
     val sparkSession = upsertConf.sparkSession
     val isInitial = upsertConf.isInitial
@@ -132,8 +135,8 @@ class UpsertBF(upsertConf: UpsertTableInDeltaConf, runId: String) {
     val bfPathFs = new Path(deltaLog.dataPath, "_bf_index_" + deltaLog.snapshot.version)
     val bfPath = bfPathFs.toUri.getPath
 
-    if (deltaLog.fs.exists(bfPathFs)) {
-      deltaLog.fs.mkdirs(newBFPathFs)
+    if (fs.exists(bfPathFs)) {
+      fs.mkdirs(newBFPathFs)
       val deletePaths = deletedFiles.map(f => f.path).toSet
       sparkSession.read.parquet(bfPath).repartition(1).as[BFItem].
         filter { f =>
@@ -150,7 +153,7 @@ class UpsertBF(upsertConf: UpsertTableInDeltaConf, runId: String) {
     // create new BF file for current version and the version uncommitted yet.
     //
     var realAddFiles = addFiles
-    if (!deltaLog.fs.exists(bfPathFs) && deltaLog.snapshot.version > -1) {
+    if (!fs.exists(bfPathFs) && deltaLog.snapshot.version > -1) {
       realAddFiles ++= deltaLog.snapshot.allFiles.collect()
       realAddFiles = realAddFiles.filterNot(addfile => deletedFiles.map(_.path).contains(addfile.path))
     }
@@ -168,7 +171,7 @@ class UpsertBF(upsertConf: UpsertTableInDeltaConf, runId: String) {
         partitionSchema = StructType(Array[StructField]()),
         dataSchema = sourceSchema,
         bucketSpec = None,
-        deltaLog.snapshot.fileFormat,
+        deltaLog.fileFormat(deltaLog.snapshot.metadata),
         deltaLog.snapshot.metadata.format.options)(sparkSession)
 
       Dataset.ofRows(sparkSession, LogicalRelation(relation, isStreaming = isStreaming))

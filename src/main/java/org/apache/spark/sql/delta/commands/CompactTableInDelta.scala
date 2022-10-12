@@ -1,9 +1,11 @@
 package org.apache.spark.sql.delta.commands
 
 import org.apache.hadoop.fs.{FileStatus, Path}
+import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
 import org.apache.spark.sql.delta.actions.{Action, AddFile, RemoveFile}
-import org.apache.spark.sql.delta.schema.{DeltaInvariantCheckerExec, ImplicitMetadataOperation, Invariants}
-import org.apache.spark.sql.delta.{DeltaConcurrentModificationException, _}
+import org.apache.spark.sql.delta.schema.ImplicitMetadataOperation
+import org.apache.spark.sql.delta._
+import org.apache.spark.sql.delta.constraints.{DeltaInvariantCheckerExec, Invariants}
 import org.apache.spark.sql.execution.SQLExecution
 import org.apache.spark.sql.execution.command.RunnableCommand
 import org.apache.spark.sql.execution.datasources.FileFormatWriter
@@ -13,25 +15,26 @@ import tech.mlsql.common.PathFun
 import scala.collection.mutable.ArrayBuffer
 
 /**
-  *
-  * CompactTableInDelta is used to compact small files into big files.
-  * This class requires the delta table should satisfied the following requirements:
-  *
-  * 1. There is at least one checkpoint have been generated.
-  * 2. The target delta table should be written
-  * by SaveMode.Append(Batch) or OutputMode.Append(Stream)
-  * 3. The target delta table should not operated by upsert/delete action.
-  *
-  * @param deltaLog
-  * @param options
-  * @param partitionColumns
-  * @param configuration
-  */
+ *
+ * CompactTableInDelta is used to compact small files into big files.
+ * This class requires the delta table should satisfied the following requirements:
+ *
+ * 1. There is at least one checkpoint have been generated.
+ * 2. The target delta table should be written
+ * by SaveMode.Append(Batch) or OutputMode.Append(Stream)
+ * 3. The target delta table should not operated by upsert/delete action.
+ *
+ * @param deltaLog
+ * @param options
+ * @param partitionColumns
+ * @param configuration
+ */
 case class CompactTableInDelta(
                                 deltaLog: DeltaLog,
                                 options: DeltaOptions,
                                 partitionColumns: Seq[String],
-                                configuration: Map[String, String]
+                                configuration: Map[String, String],
+                                child:Seq[LogicalPlan] = Seq()
                               )
   extends RunnableCommand
     with ImplicitMetadataOperation
@@ -81,7 +84,7 @@ case class CompactTableInDelta(
       try {
         deltaLog.withNewTransaction { txn =>
           txn.readWholeTable()
-          val operation = DeltaOperations.Optimize(Seq(), Seq(), 0, false)
+          val operation = DeltaOperations.Optimize(Seq(), Seq())
           txn.commit(actions, operation)
           success = true
         }
@@ -104,7 +107,7 @@ case class CompactTableInDelta(
   }
 
   protected def doLogCleanup(targetVersion: Long) = {
-    val fs = deltaLog.fs
+    val fs = deltaLog.logPath.getFileSystem(deltaLog.newDeltaHadoopConf())
     var numDeleted = 0
     listExpiredDeltaLogs(targetVersion).map(_.getPath).foreach { path =>
       // recursive = false
@@ -116,11 +119,11 @@ case class CompactTableInDelta(
   }
 
   /**
-    * Returns an iterator of expired delta logs that can be cleaned up. For a delta log to be
-    * considered as expired, it must:
-    *  - have a checkpoint file after it
-    *  - be earlier than `targetVersion`
-    */
+   * Returns an iterator of expired delta logs that can be cleaned up. For a delta log to be
+   * considered as expired, it must:
+   *  - have a checkpoint file after it
+   *  - be earlier than `targetVersion`
+   */
   private def listExpiredDeltaLogs(targetVersion: Long): Iterator[FileStatus] = {
     import org.apache.spark.sql.delta.util.FileNames._
 
@@ -150,7 +153,7 @@ case class CompactTableInDelta(
       .foreach { item =>
         val path = new Path(deltaLog.dataPath, item.path)
         val pathCrc = new Path(deltaLog.dataPath, "." + item.path + ".crc")
-        val fs = deltaLog.fs
+        val fs = deltaLog.logPath.getFileSystem(deltaLog.newDeltaHadoopConf())
         try {
           fs.delete(path, false)
           fs.delete(pathCrc, false)
@@ -169,7 +172,7 @@ case class CompactTableInDelta(
       .foreach { item =>
         val path = new Path(deltaLog.dataPath, item.path)
         val pathCrc = new Path(deltaLog.dataPath, "." + item.path + ".crc")
-        val fs = deltaLog.fs
+        val fs = deltaLog.logPath.getFileSystem(deltaLog.newDeltaHadoopConf())
         try {
           fs.delete(path, false)
           fs.delete(pathCrc, false)
@@ -200,7 +203,7 @@ case class CompactTableInDelta(
     // Validate partition predicates
     val replaceWhere = options.replaceWhere
     val partitionFilters = if (replaceWhere.isDefined) {
-      val predicates = parsePartitionPredicates(sparkSession, replaceWhere.get)
+      val predicates = parsePredicates(sparkSession, replaceWhere.get)
       Some(predicates)
     } else {
       None
@@ -220,11 +223,11 @@ case class CompactTableInDelta(
        """.stripMargin)
 
     /**
-      * No matter the table is a partition table or not,
-      * we can pick one version and compact all files
-      * before it and then remove all the files compacted and
-      * add the new compaction files.
-      */
+     * No matter the table is a partition table or not,
+     * we can pick one version and compact all files
+     * before it and then remove all the files compacted and
+     * add the new compaction files.
+     */
     var version = configuration.get(COMPACT_VERSION_OPTION).map(_.toLong).getOrElse(-1L)
     if (version == -1) version = readVersion
 
@@ -244,7 +247,7 @@ case class CompactTableInDelta(
         snapshot.allFiles
       case Some(predicates) =>
         DeltaLog.filterFileList(
-          metadata.partitionColumns, snapshot.allFiles.toDF(), predicates).as[AddFile]
+          metadata.partitionSchema, snapshot.allFiles.toDF(), predicates).as[AddFile]
     }
 
 
@@ -269,7 +272,7 @@ case class CompactTableInDelta(
 
       val invariants = Invariants.getFromSchema(metadata.schema, spark)
 
-      SQLExecution.withNewExecutionId(spark, queryExecution) {
+      SQLExecution.withNewExecutionId(queryExecution) {
         val outputSpec = FileFormatWriter.OutputSpec(
           outputPath.toString,
           Map.empty,
@@ -280,7 +283,7 @@ case class CompactTableInDelta(
         FileFormatWriter.write(
           sparkSession = spark,
           plan = physicalPlan,
-          fileFormat = snapshot.fileFormat, // TODO doesn't support changing formats.
+          fileFormat = deltaLog.fileFormat(metadata), // TODO doesn't support changing formats.
           committer = committer,
           outputSpec = outputSpec,
           hadoopConf = spark.sessionState.newHadoopConfWithOptions(metadata.configuration),
@@ -331,7 +334,7 @@ case class CompactTableInDelta(
   override protected val canMergeSchema: Boolean = false
   override protected val canOverwriteSchema: Boolean = false
 
-
+  override protected def withNewChildrenInternal(newChildren: IndexedSeq[LogicalPlan]): LogicalPlan = copy(child = newChildren)
 }
 
 object CompactTableInDelta {
